@@ -1,3 +1,4 @@
+use globset::GlobSet;
 use ignore::WalkBuilder;
 use std::path::{Path, PathBuf};
 
@@ -52,16 +53,25 @@ pub struct SourceFile {
     pub lang: Lang,
 }
 
-pub fn collect_source_files(root: &Path) -> anyhow::Result<Vec<SourceFile>> {
+pub fn collect_source_files(root: &Path, excludes: &GlobSet) -> anyhow::Result<Vec<SourceFile>> {
     let mut files = Vec::new();
+    let root_owned = root.to_path_buf();
+    let excludes = excludes.clone();
     let walker = WalkBuilder::new(root)
         .hidden(true)
         .git_ignore(true)
         .git_exclude(true)
-        .filter_entry(|entry| {
+        .filter_entry(move |entry| {
             if entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
                 if let Some(name) = entry.file_name().to_str() {
-                    return !SKIP_DIRS.contains(&name);
+                    if SKIP_DIRS.contains(&name) {
+                        return false;
+                    }
+                }
+            }
+            if let Ok(rel) = entry.path().strip_prefix(&root_owned) {
+                if !rel.as_os_str().is_empty() && excludes.is_match(rel) {
+                    return false;
                 }
             }
             true

@@ -14,7 +14,21 @@ pub fn is_under_node_modules(path: &Path) -> bool {
         .any(|c| c.as_os_str() == "node_modules")
 }
 
-/// Resolves `candidate` to a concrete JS/TS file: as-is, with a resolvable
+/// TS's own convention under `moduleResolution: bundler/nodenext`:
+/// relative imports write the *emitted* extension (`./foo.js`) even
+/// though the source file on disk is `./foo.ts`.
+fn ts_source_extension(ext: &str) -> Option<&'static str> {
+    match ext {
+        "js" => Some("ts"),
+        "jsx" => Some("tsx"),
+        "mjs" => Some("mts"),
+        "cjs" => Some("cts"),
+        _ => None,
+    }
+}
+
+/// Resolves `candidate` to a concrete JS/TS file: as-is, with its
+/// emitted-JS extension swapped for the TS source one, with a resolvable
 /// extension appended, or as a directory containing an `index.*`. Shared
 /// by relative-import resolution, workspace-package resolution, and
 /// tsconfig path-alias resolution. Never resolves into `node_modules`.
@@ -24,6 +38,14 @@ pub fn resolve_js_like_file(candidate: &Path) -> Option<PathBuf> {
     }
     if candidate.is_file() {
         return Some(candidate.to_path_buf());
+    }
+    if let Some(ext) = candidate.extension().and_then(|e| e.to_str()) {
+        if let Some(ts_ext) = ts_source_extension(ext) {
+            let swapped = candidate.with_extension(ts_ext);
+            if swapped.is_file() {
+                return Some(swapped);
+            }
+        }
     }
     let base = candidate.to_string_lossy().to_string();
     for ext in RESOLVE_EXTS {

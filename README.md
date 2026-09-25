@@ -56,6 +56,11 @@ so you can be more specific.
   The default, in other words, is already "just files with real code,
   and how they actually connect." Pass both flags if you want the full
   picture including barrels and third-party packages.
+- `--exclude <glob>` — skip files/directories matching this
+  gitignore-style glob, relative to `dir`. Repeatable:
+  `--exclude '**/*.test.ts' --exclude 'legacy/**'`. On top of whatever
+  `.gitignore` already excludes and the always-skipped directories
+  below.
 
 ## What gets scanned
 
@@ -67,7 +72,7 @@ are skipped, and these directories are always skipped regardless of
 `.gitignore`: `node_modules`, `dist`, `build`, `out`, `target`, `.next`,
 `.nuxt`, `__pycache__`, `.venv`, `venv`, `env`, `.mypy_cache`,
 `.pytest_cache`, `.tox`, `coverage`, `vendor`, `.idea`, `.vscode`,
-`.gradle`, `.settings`, `.git`.
+`.gradle`, `.settings`, `.git`. Add more with `--exclude` (see above).
 
 ## Output schema
 
@@ -154,9 +159,25 @@ one write to `ctx.json`, nothing else to keep in sync.
 
 - **JS/TS**: relative imports (`./`, `../`, and root-relative `/`) are
   resolved on disk trying `.ts .tsx .js .jsx .mjs .cjs .json` and
-  `index.*`. `require()`, dynamic `import()`, and basic CommonJS
-  (`module.exports`, `exports.x`) are all picked up alongside ESM
-  `import`/`export`.
+  `index.*`. If the specifier itself already has a `.js`/`.jsx`/`.mjs`/
+  `.cjs` extension but no such file exists, its TS-source equivalent is
+  tried too (`.ts`/`.tsx`/`.mts`/`.cts`) — the standard pattern under
+  `moduleResolution: bundler`/`nodenext`, where you write the *emitted*
+  extension (`import './foo.js'`) even though the source is `./foo.ts`.
+  `require()`, dynamic `import()`, and basic CommonJS (`module.exports`,
+  `exports.x`) are all picked up alongside ESM `import`/`export`.
+
+  Barrel re-exports are resolved **per imported name**, not per file:
+  if `a/index.ts` does `export * from './foo'; export * from './baz'`,
+  then `import { FOO } from 'a'` resolves through to `a/foo.ts`
+  specifically and `import { BAZ } from 'a'` to `a/baz.ts`, rather than
+  both fanning out to everything the barrel re-exports. This falls back
+  to the barrel's *entire* surface (still correct, just less precise)
+  whenever a name can't be narrowed: namespace imports (`import * as
+  ns`), `require(...)`/dynamic `import(...)` (their destructuring isn't
+  tracked), or a re-exported name whose own source file's exports
+  aren't fully enumerable (e.g. it re-exports from an external package,
+  or does `module.exports = {...}`).
 
   Bare specifiers (`import { foo } from 'a'`) are first checked against
   every `package.json` found under the scanned root (skipping
@@ -185,7 +206,11 @@ one write to `ctx.json`, nothing else to keep in sync.
   modules, and `from pkg import name` where `name` is either a
   submodule or an attribute re-exported by `pkg/__init__.py`. Stdlib
   and third-party imports are always external (no `site-packages`
-  resolution).
+  resolution). Unlike JS/TS, re-exports through `__init__.py` are not
+  yet resolved per-name — importing two different names re-exported by
+  the same `__init__.py` will currently show both importers depending
+  on everything that `__init__.py` re-exports, not just the specific
+  name each one uses.
 - **Java**: resolution is index-based — every `.java` file's `package`
   declaration and top-level type names are scanned first, then imports
   are matched against that index. Only types declared inside the

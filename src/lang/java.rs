@@ -2,7 +2,7 @@ use std::collections::HashMap;
 
 use tree_sitter::{Node, Tree};
 
-use crate::facts::{DepRef, FileFacts};
+use crate::facts::{DepRef, Dependency, FileFacts, ImportWant};
 use crate::tsutil::*;
 
 const TOP_LEVEL_TYPE_KINDS: &[&str] = &[
@@ -131,6 +131,7 @@ pub fn resolve(
     let mut facts = FileFacts::default();
     facts.exports = types.to_vec();
     facts.has_local_exports = !types.is_empty();
+    let mut deps: Vec<DepRef> = Vec::new();
     for imp in imports {
         match (imp.is_wildcard, imp.is_static) {
             (true, false) => {
@@ -138,28 +139,22 @@ pub fn resolve(
                     let mut any = false;
                     for f in files {
                         if f != self_rel {
-                            facts.dependencies.push(DepRef::Internal(f.clone()));
+                            deps.push(DepRef::Internal(f.clone()));
                             any = true;
                         }
                     }
                     if !any {
-                        facts
-                            .dependencies
-                            .push(DepRef::External(format!("{}.*", imp.path)));
+                        deps.push(DepRef::External(format!("{}.*", imp.path)));
                     }
                 } else {
-                    facts
-                        .dependencies
-                        .push(DepRef::External(format!("{}.*", imp.path)));
+                    deps.push(DepRef::External(format!("{}.*", imp.path)));
                 }
             }
             (true, true) => {
                 // `import static pkg.Type.*;` -- imp.path is the class FQN.
                 match index.type_index.get(&imp.path) {
-                    Some(f) => facts.dependencies.push(DepRef::Internal(f.clone())),
-                    None => facts
-                        .dependencies
-                        .push(DepRef::External(format!("{}.*", imp.path))),
+                    Some(f) => deps.push(DepRef::Internal(f.clone())),
+                    None => deps.push(DepRef::External(format!("{}.*", imp.path))),
                 }
             }
             (false, true) => {
@@ -169,24 +164,24 @@ pub fn resolve(
                 if let Some(idx) = imp.path.rfind('.') {
                     let parent = &imp.path[..idx];
                     if let Some(f) = index.type_index.get(parent) {
-                        facts.dependencies.push(DepRef::Internal(f.clone()));
+                        deps.push(DepRef::Internal(f.clone()));
                         continue;
                     }
                 }
                 match index.type_index.get(&imp.path) {
-                    Some(f) => facts.dependencies.push(DepRef::Internal(f.clone())),
-                    None => facts
-                        .dependencies
-                        .push(DepRef::External(imp.path.clone())),
+                    Some(f) => deps.push(DepRef::Internal(f.clone())),
+                    None => deps.push(DepRef::External(imp.path.clone())),
                 }
             }
             (false, false) => match index.type_index.get(&imp.path) {
-                Some(f) => facts.dependencies.push(DepRef::Internal(f.clone())),
-                None => facts
-                    .dependencies
-                    .push(DepRef::External(imp.path.clone())),
+                Some(f) => deps.push(DepRef::Internal(f.clone())),
+                None => deps.push(DepRef::External(imp.path.clone())),
             },
         }
     }
+    facts.dependencies = deps
+        .into_iter()
+        .map(|target| Dependency { target, want: ImportWant::All })
+        .collect();
     facts
 }

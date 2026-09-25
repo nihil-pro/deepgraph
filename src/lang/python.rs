@@ -2,7 +2,7 @@ use std::path::{Path, PathBuf};
 
 use tree_sitter::{Node, Tree};
 
-use crate::facts::{DepRef, FileFacts};
+use crate::facts::{DepRef, Dependency, FileFacts, ImportWant};
 use crate::tsutil::*;
 
 pub fn analyze(tree: &Tree, src: &[u8], root: &Path, importer_dir: &Path, file_rel: &str) -> FileFacts {
@@ -27,7 +27,15 @@ pub fn analyze(tree: &Tree, src: &[u8], root: &Path, importer_dir: &Path, file_r
             }
         }
     }
-    facts.dependencies = deps;
+    // Python's `from pkg import name` already resolves to a specific
+    // submodule when one exists (see `resolve_submodule` below), so the
+    // barrel-blending problem is narrower here than in JS/TS; per-name
+    // tracking through `__init__.py` re-exports isn't implemented yet,
+    // so every edge is conservatively `All`.
+    facts.dependencies = deps
+        .into_iter()
+        .map(|target| Dependency { target, want: ImportWant::All })
+        .collect();
 
     // Only a module's own top level defines its public surface.
     let mut all_list: Option<Vec<String>> = None;

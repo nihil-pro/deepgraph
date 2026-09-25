@@ -9,6 +9,7 @@ mod walk;
 use std::path::{Path, PathBuf};
 
 use clap::{Parser as ClapParser, Subcommand};
+use globset::{Glob, GlobSet, GlobSetBuilder};
 use serde::Serialize;
 
 use model::{CtxStore, Graph, Node};
@@ -53,6 +54,12 @@ enum Command {
         /// the real files that used to sit behind them.
         #[arg(long)]
         with_barrels: bool,
+
+        /// Exclude files/directories matching this gitignore-style glob
+        /// (relative to `dir`), e.g. `--exclude '**/*.test.ts'` or
+        /// `--exclude 'legacy/**'`. Repeatable.
+        #[arg(long = "exclude")]
+        excludes: Vec<String>,
     },
 
     /// Print one file's node from `<output>.graph.json`, merged with its
@@ -95,12 +102,28 @@ fn derive_paths(base: &Path) -> (PathBuf, PathBuf) {
     )
 }
 
-fn run_build(dir: PathBuf, output: PathBuf, compact: bool, with_external: bool, with_barrels: bool) -> anyhow::Result<()> {
+fn build_excludes(patterns: &[String]) -> anyhow::Result<GlobSet> {
+    let mut builder = GlobSetBuilder::new();
+    for p in patterns {
+        builder.add(Glob::new(p).map_err(|e| anyhow::anyhow!("invalid --exclude pattern {p:?}: {e}"))?);
+    }
+    Ok(builder.build()?)
+}
+
+fn run_build(
+    dir: PathBuf,
+    output: PathBuf,
+    compact: bool,
+    with_external: bool,
+    with_barrels: bool,
+    excludes: &[String],
+) -> anyhow::Result<()> {
     let root = dir
         .canonicalize()
         .map_err(|e| anyhow::anyhow!("cannot access directory {:?}: {e}", dir))?;
 
-    let files = walk::collect_source_files(&root)?;
+    let exclude_set = build_excludes(excludes)?;
+    let files = walk::collect_source_files(&root, &exclude_set)?;
     eprintln!("depgraph: scanning {} source file(s) under {}", files.len(), root.display());
 
     let opts = graph::GraphOptions {
@@ -210,7 +233,8 @@ fn main() -> anyhow::Result<()> {
             compact,
             with_external,
             with_barrels,
-        } => run_build(dir, output, compact, with_external, with_barrels),
+            excludes,
+        } => run_build(dir, output, compact, with_external, with_barrels, &excludes),
         Command::Show { output, file, compact } => run_show(output, file, compact),
     }
 }

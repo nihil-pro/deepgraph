@@ -2,7 +2,7 @@ use std::path::Path;
 
 use tree_sitter::{Node, Tree};
 
-use crate::facts::{DepRef, FileFacts};
+use crate::facts::{DepRef, Dependency, FileFacts, ImportWant};
 use crate::lang::js_pkg::JsPackageIndex;
 use crate::lang::ts_paths::TsPathsIndex;
 use crate::tsutil::*;
@@ -16,24 +16,31 @@ pub fn analyze(
     ts_paths_index: &TsPathsIndex,
 ) -> FileFacts {
     let mut facts = FileFacts::default();
-    let mut raw_deps: Vec<String> = Vec::new(); // plain import/require specifiers
-    let mut raw_reexports: Vec<String> = Vec::new(); // export ... from specifiers
+    let mut has_any_reexport = false;
 
     let root_node = tree.root_node();
     let mut stack = vec![root_node];
     while let Some(node) = stack.pop() {
         match node.kind() {
             "import_statement" => {
-                if let Some(spec) = import_source(node, src) {
-                    raw_deps.push(spec);
-                }
+                handle_import_statement(node, src, root, importer_dir, pkg_index, ts_paths_index, &mut facts);
             }
             "export_statement" => {
-                handle_export_statement(node, src, &mut facts, &mut raw_deps, &mut raw_reexports);
+                handle_export_statement(
+                    node,
+                    src,
+                    root,
+                    importer_dir,
+                    pkg_index,
+                    ts_paths_index,
+                    &mut facts,
+                    &mut has_any_reexport,
+                );
             }
             "call_expression" => {
                 if let Some(spec) = require_or_dynamic_import_source(node, src) {
-                    raw_deps.push(spec);
+                    let target = resolve_specifier(root, importer_dir, &spec, pkg_index, ts_paths_index);
+                    facts.dependencies.push(Dependency { target, want: ImportWant::All });
                 }
             }
             "assignment_expression" => {
@@ -48,24 +55,10 @@ pub fn analyze(
         }
     }
 
-    facts.has_reexports = !raw_reexports.is_empty();
-
-    let mut seen = std::collections::HashSet::new();
-    for spec in raw_deps.into_iter().chain(raw_reexports.into_iter()) {
-        if !seen.insert(spec.clone()) {
-            continue;
-        }
-        facts
-            .dependencies
-            .push(resolve_specifier(root, importer_dir, &spec, pkg_index, ts_paths_index));
-    }
-
+    facts.has_reexports = has_any_reexport;
+    facts.exports.sort();
+    facts.exports.dedup();
     facts
-}
-
-fn import_source(node: Node, src: &[u8]) -> Option<String> {
-    let source_node = node.child_by_field_name("source")?;
-    string_literal_content(source_node, src)
 }
 
 fn require_or_dynamic_import_source(node: Node, src: &[u8]) -> Option<String> {
@@ -109,31 +102,104 @@ fn handle_commonjs_assignment(node: Node, src: &[u8], facts: &mut FileFacts) {
     }
 }
 
+/// What names an `import_clause` (the part between `import` and `from`)
+/// actually binds, as seen from the *source* module's perspective (i.e.
+/// each name's `name` field, not its local `alias`).
+fn import_clause_want(clause: Node, src: &[u8]) -> ImportWant {
+    let mut names = Vec::new();
+    let mut cursor = clause.walk();
+    for child in clause.children(&mut cursor) {
+        match child.kind() {
+            "identifier" => names.push("default".to_string()),
+            "namespace_import" => return ImportWant::All,
+            "named_imports" => {
+                for spec_node in children_of_kind(child, "import_specifier") {
+                    if let Some(name) = spec_node.child_by_field_name("name") {
+                        names.push(node_text(name, src).to_string());
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    ImportWant::Named(names)
+}
+
+fn handle_import_statement(
+    node: Node,
+    src: &[u8],
+    root: &Path,
+    importer_dir: &Path,
+    pkg_index: &JsPackageIndex,
+    ts_paths_index: &TsPathsIndex,
+    facts: &mut FileFacts,
+) {
+    let Some(source_node) = node.child_by_field_name("source") else {
+        return;
+    };
+    let Some(spec) = string_literal_content(source_node, src) else {
+        return;
+    };
+    let target = resolve_specifier(root, importer_dir, &spec, pkg_index, ts_paths_index);
+    let want = match first_child_of_kind(node, "import_clause") {
+        None => ImportWant::All, // side-effect import: `import 'mod'`
+        Some(clause) => import_clause_want(clause, src),
+    };
+    facts.dependencies.push(Dependency { target, want });
+}
+
 fn handle_export_statement(
     node: Node,
     src: &[u8],
+    root: &Path,
+    importer_dir: &Path,
+    pkg_index: &JsPackageIndex,
+    ts_paths_index: &TsPathsIndex,
     facts: &mut FileFacts,
-    raw_deps: &mut Vec<String>,
-    raw_reexports: &mut Vec<String>,
+    has_any_reexport: &mut bool,
 ) {
     let source_spec = node
         .child_by_field_name("source")
         .and_then(|s| string_literal_content(s, src));
 
     if let Some(spec) = source_spec {
-        raw_reexports.push(spec);
+        *has_any_reexport = true;
+        let target = resolve_specifier(root, importer_dir, &spec, pkg_index, ts_paths_index);
+
         if let Some(clause) = first_child_of_kind(node, "export_clause") {
+            // `export { x, y as z } from './foo'`: each name's source in
+            // `foo` is known exactly, and so is what it's called here.
+            let mut wanted = Vec::new();
             for spec_node in children_of_kind(clause, "export_specifier") {
-                if let Some(name) = spec_node
+                let Some(orig) = spec_node.child_by_field_name("name") else {
+                    continue;
+                };
+                let orig = node_text(orig, src).to_string();
+                let external_name = spec_node
                     .child_by_field_name("alias")
-                    .or_else(|| spec_node.child_by_field_name("name"))
-                {
-                    facts.exports.push(node_text(name, src).to_string());
-                }
+                    .map(|a| node_text(a, src).to_string())
+                    .unwrap_or_else(|| orig.clone());
+                facts.exports.push(external_name.clone());
+                facts.name_sources.push((external_name, target.clone()));
+                wanted.push(orig);
             }
+            facts.dependencies.push(Dependency { target, want: ImportWant::Named(wanted) });
+        } else if let Some(ns) = first_child_of_kind(node, "namespace_export") {
+            // `export * as ns from './foo'`: everything in foo is only
+            // reachable through the single name `ns`.
+            if let Some(ident) = first_named_child_of_kinds(ns, &["identifier"]) {
+                let alias = node_text(ident, src).to_string();
+                facts.exports.push(alias.clone());
+                facts.name_sources.push((alias, target.clone()));
+            }
+            facts.dependencies.push(Dependency { target, want: ImportWant::All });
         } else {
-            // `export * from '...'` or `export * as ns from '...'`
+            // `export * from './foo'`: which names this actually
+            // provides depends on foo's own exports, not known until
+            // graph.rs cross-references every file's `exports`.
             facts.exports.push("*".to_string());
+            facts.wildcard_fallbacks.push(target.clone());
+            facts.dependencies.push(Dependency { target, want: ImportWant::All });
         }
         return;
     }
@@ -163,7 +229,6 @@ fn handle_export_statement(
                 facts.exports.push(node_text(name, src).to_string());
             }
         }
-        let _ = raw_deps; // reserved: local `export { a }` has no module source
     }
 }
 
